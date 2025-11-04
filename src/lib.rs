@@ -1,14 +1,15 @@
 use once_cell::sync::Lazy;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    net::UdpSocket,
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     os::raw::{c_int, c_uchar, c_uint, c_ulonglong},
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc,
         Arc, RwLock,
     },
     thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 #[cfg(all(feature = "realtime", any(target_os = "linux", target_os = "windows")))]
 use thread_priority::*;
@@ -26,8 +27,21 @@ struct Instance {
     stop: Arc<AtomicBool>,
 }
 
+struct SenderInst {
+    tx: mpsc::Sender<PcmChunk>,
+    stop: Arc<AtomicBool>,
+}
+
 static INSTANCES: Lazy<RwLock<HashMap<u64, Instance>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static SENDERS: Lazy<RwLock<HashMap<u64, SenderInst>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static NEXT_ID: Lazy<RwLock<u64>> = Lazy::new(|| RwLock::new(1));
+
+// PCM chunk passed to sender thread
+struct PcmChunk {
+    data: Vec<i16>,
+    sample_rate: u32,
+    channels: u8,
+}
 
 #[no_mangle]
 pub extern "C" fn gas_create_rtp_receiver(bind_port: u16) -> c_ulonglong {
@@ -393,6 +407,226 @@ fn set_realtime_priority() -> Result<(), ()> {
 
 #[cfg(not(feature = "realtime"))]
 fn set_realtime_priority() -> Result<(), ()> { Ok(()) }
+
+/* ---------------- RTP Sender (G.711) ---------------- */
+
+fn i16_to_ulaw(sample: i16) -> u8 {
+    // Inverse of ulaw_to_i16; standard algorithm
+    const BIAS: i32 = 0x84;
+    let mut s = sample as i32;
+    let sign = if s < 0 { 0x80 } else { 0 };
+    if s < 0 { s = -s; }
+    s += BIAS;
+    if s > 0x7FFF { s = 0x7FFF; }
+    let mut exponent = 7;
+    let mut mask = 0x4000;
+    while exponent > 0 && (s & mask) == 0 {
+        exponent -= 1;
+        mask >>= 1;
+    }
+    let mantissa = if exponent == 0 { (s >> 4) & 0x0F } else { (s >> (exponent + 3)) & 0x0F };
+    let ulaw = !(sign | (exponent << 4) | mantissa) as u8;
+    ulaw
+}
+
+fn i16_to_alaw(sample: i16) -> u8 {
+    // Standard A-law encoder
+    let mut s = sample as i32;
+    let sign = if s >= 0 { 0x80 } else { 0x00 };
+    if s < 0 { s = -s - 1; }
+
+    let (exponent, mantissa) = if s > 0x7F {
+        // Find exponent
+        let mut exp = 7;
+        let mut mask = 0x4000;
+        while exp > 0 && (s & mask) == 0 {
+            exp -= 1;
+            mask >>= 1;
+        }
+        let man = (s >> (exp + 3)) & 0x0F;
+        (exp as u8, man as u8)
+    } else {
+        (0u8, (s >> 4) as u8)
+    };
+
+    let alaw = (!((sign) | (exponent << 4) | (mantissa & 0x0F))) ^ 0x55;
+    alaw
+}
+
+struct RtpSenderState {
+    seq: u16,
+    ts: u32,
+    ssrc: u32,
+    payload_type: u8,
+}
+
+fn build_rtp_header(buf: &mut [u8; 12], st: &RtpSenderState) {
+    buf[0] = 0x80; // V=2
+    buf[1] = st.payload_type & 0x7F; // no marker
+    buf[2..4].copy_from_slice(&st.seq.to_be_bytes());
+    buf[4..8].copy_from_slice(&st.ts.to_be_bytes());
+    buf[8..12].copy_from_slice(&st.ssrc.to_be_bytes());
+}
+
+fn downmix_to_mono(input: &[i16], channels: u8) -> Vec<i16> {
+    if channels <= 1 { return input.to_vec(); }
+    let ch = channels as usize;
+    let frames = input.len() / ch;
+    let mut out = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let mut acc: i32 = 0;
+        for c in 0..ch {
+            acc += input[f * ch + c] as i32;
+        }
+        out.push((acc / ch as i32) as i16);
+    }
+    out
+}
+
+fn downsample_2_to_1(input: &[i16]) -> Vec<i16> {
+    // Simple 2:1 decimation with averaging of pairs
+    let mut out = Vec::with_capacity((input.len() + 1) / 2);
+    let mut i = 0;
+    while i + 1 < input.len() {
+        let v = ((input[i] as i32 + input[i + 1] as i32) / 2) as i16;
+        out.push(v);
+        i += 2;
+    }
+    if i < input.len() {
+        out.push(input[i]);
+    }
+    out
+}
+
+fn resample_linear_to_rate(input: &[i16], in_rate: u32, out_rate: u32) -> Vec<i16> {
+    if input.is_empty() { return Vec::new(); }
+    if in_rate == out_rate { return input.to_vec(); }
+    let ratio = out_rate as f64 / in_rate as f64;
+    let out_len = ((input.len() as f64) * ratio).floor().max(1.0) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for n in 0..out_len {
+        let src_pos = (n as f64) / ratio;
+        let i0 = src_pos.floor() as usize;
+        let frac = (src_pos - i0 as f64) as f32;
+        let i1 = if i0 + 1 < input.len() { i0 + 1 } else { i0 };
+        let a = input[i0] as f32;
+        let b = input[i1] as f32;
+        let y = a + (b - a) * frac;
+        out.push(y.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+    }
+    out
+}
+
+#[no_mangle]
+pub extern "C" fn gas_create_rtp_sender(local_bind_port: u16, remote_ipv4_be: u32, remote_port: u16, payload_type: u8) -> c_ulonglong {
+    // Only PT 0 (PCMU) and 8 (PCMA) supported
+    if payload_type != 0 && payload_type != 8 {
+        return 0;
+    }
+
+    let id = {
+        let mut n = NEXT_ID.write().unwrap();
+        let v = *n;
+        *n += 1;
+        v
+    };
+
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<PcmChunk>();
+
+    let stop_clone = stop_flag.clone();
+    thread::spawn(move || {
+        #[cfg(all(feature = "realtime", any(target_os = "linux", target_os = "windows")))]
+        { let _ = set_realtime_priority(); }
+
+        let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_bind_port);
+        let sock = match UdpSocket::bind(local) { Ok(s) => s, Err(_) => return };
+        let ip = Ipv4Addr::from(remote_ipv4_be);
+        let remote = SocketAddrV4::new(ip, remote_port);
+
+        let start_ns = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        let mut st = RtpSenderState {
+            seq: (start_ns & 0xFFFF) as u16,
+            ts: 0,
+            ssrc: (start_ns as u32) ^ 0xA5A5_5A5A,
+            payload_type,
+        };
+
+        let mut pcm_buf: Vec<i16> = Vec::new();
+        let mut rtp_hdr = [0u8; 12];
+        loop {
+            if stop_clone.load(Ordering::Relaxed) { break; }
+            // Try recv with timeout-like behavior
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(chunk) => {
+                    // downmix
+                    let mut mono = downmix_to_mono(&chunk.data, chunk.channels);
+                    // resample to 8k if needed
+                    if chunk.sample_rate == 16000 {
+                        mono = downsample_2_to_1(&mono);
+                    } else if chunk.sample_rate != 8000 {
+                        // Generic linear resample to 8 kHz for arbitrary input rates
+                        mono = resample_linear_to_rate(&mono, chunk.sample_rate, 8000);
+                    }
+                    pcm_buf.extend_from_slice(&mono);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => break,
+            }
+
+            // Packetize into 160-sample frames
+            const FRAME: usize = 160; // 20 ms @ 8k
+            while pcm_buf.len() >= FRAME {
+                let frame = &pcm_buf[..FRAME];
+                let mut payload = [0u8; FRAME];
+                if st.payload_type == 0 {
+                    for (i, &s) in frame.iter().enumerate() { payload[i] = i16_to_ulaw(s); }
+                } else {
+                    for (i, &s) in frame.iter().enumerate() { payload[i] = i16_to_alaw(s); }
+                }
+                build_rtp_header(&mut rtp_hdr, &st);
+                let mut pkt = Vec::with_capacity(12 + FRAME);
+                pkt.extend_from_slice(&rtp_hdr);
+                pkt.extend_from_slice(&payload);
+                let _ = sock.send_to(&pkt, remote);
+                // advance
+                st.seq = st.seq.wrapping_add(1);
+                st.ts = st.ts.wrapping_add(FRAME as u32);
+                // remove frame from buffer
+                pcm_buf.drain(..FRAME);
+            }
+        }
+    });
+
+    let inst = SenderInst { tx, stop: stop_flag };
+    SENDERS.write().unwrap().insert(id, inst);
+    id as c_ulonglong
+}
+
+#[no_mangle]
+pub extern "C" fn gas_push_pcm(sender_inst: c_ulonglong, pcm: *const i16, samples: usize, sample_rate: c_uint, channels: c_uchar) {
+    if samples == 0 || pcm.is_null() { return; }
+    let id = sender_inst as u64;
+    let map = SENDERS.read().unwrap();
+    if let Some(s) = map.get(&id) {
+        let slice = unsafe { std::slice::from_raw_parts(pcm, samples) };
+        let chunk = PcmChunk { data: slice.to_vec(), sample_rate: sample_rate as u32, channels };
+        let _ = s.tx.send(chunk);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gas_stop_sender(sender_inst: c_ulonglong) {
+    if let Some(s) = SENDERS.read().unwrap().get(&(sender_inst as u64)) {
+        s.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gas_destroy_sender(sender_inst: c_ulonglong) {
+    gas_stop_sender(sender_inst);
+    SENDERS.write().unwrap().remove(&(sender_inst as u64));
+}
 
 /* ---------------- C ABI stubs required by some linkers ---------------- */
 #[no_mangle]

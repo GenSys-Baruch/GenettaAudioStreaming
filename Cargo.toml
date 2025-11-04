@@ -1,10 +1,10 @@
 [package]
-name = "genetta_audio_streaming"
+name = "GenettaAudioStreaming"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "GenettaAudioStreaming"
+name = "genetta_audio_streaming"  # Use lowercase for better cross-platform compatibility
 crate-type = ["cdylib"]
 
 [dependencies]
